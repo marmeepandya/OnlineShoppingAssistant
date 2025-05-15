@@ -165,10 +165,99 @@ def extract_specifications(products):
     
     return detailed_products
 
+def extract_specifications(products):
+    """
+    Extract structured specifications from product details.
+    Parses text to find key product features and specifications.
+    
+    Args:
+        products (list): List of product dicts with a 'details' field
+        
+    Returns:
+        list: Updated product list with extracted specifications
+    """
+    import re
+    import ollama
+    import logging
+    
+    logger = logging.getLogger(__name__)
+    
+    for product in products:
+        if not product.get('details') or product['details'] == "No details found.":
+            product['specifications'] = {}
+            continue
+            
+        # Truncate details to reduce token usage
+        details = product.get('details', '')
+        details_snippet = details[:1500] + "..." if len(details) > 1500 else details
+        
+        prompt = f"""Extract key product specifications from this product description as key-value pairs:
+
+{details_snippet}
+
+Look for technical specifications like:
+- Dimensions/size
+- Weight
+- Color options
+- Material
+- Battery life
+- Storage/memory
+- Connectivity options
+- Key features
+- Any other important technical specs
+
+Format your response EXACTLY as a JSON object with specification name as key and value as value.
+Example:
+{{
+  "dimensions": "5.8 x 2.8 x 0.3 inches",
+  "weight": "6.07 ounces",
+  "battery": "Up to 17 hours",
+  "storage": "128GB"
+}}
+
+If you can't find a specific specification, don't include that key in the JSON.
+"""
+
+        try:
+            response = ollama.chat(model="llama3.1", messages=[
+                {"role": "system", "content": "You extract structured product specifications."},
+                {"role": "user", "content": prompt}
+            ])
+            
+            # Extract JSON from response
+            spec_text = response['message']['content'].strip()
+            
+            # Find JSON block in the response
+            json_match = re.search(r'({[\s\S]*?})', spec_text)
+            if json_match:
+                spec_text = json_match.group(1)
+            
+            # Try to parse the JSON
+            try:
+                import json
+                specs = json.loads(spec_text)
+                product['specifications'] = specs
+            except json.JSONDecodeError:
+                # Fallback: Extract key-value pairs using regex
+                specs = {}
+                lines = spec_text.split('\n')
+                for line in lines:
+                    kv_match = re.search(r'"([^"]+)":\s*"([^"]+)"', line)
+                    if kv_match:
+                        key, value = kv_match.groups()
+                        specs[key] = value
+                product['specifications'] = specs
+                
+        except Exception as e:
+            logger.error(f"Error extracting specifications: {e}")
+            product['specifications'] = {}
+    
+    return products
+
 def rank_products(products, user_query, max_price=None):
     """
     Rank products using a point-based system and LLaMA 3 for analysis.
-    More flexible than the previous implementation, keeping more products in results.
+    Extracts specifications and provides detailed recommendation reasons.
     
     Args:
         products (list): List of product dicts with fields like title, price, rating, content
@@ -188,6 +277,13 @@ def rank_products(products, user_query, max_price=None):
     
     if not products:
         return [], {"text": "No products found.", "products": []}
+    
+    # Extract specifications before ranking to use in analysis
+    try:
+        products = extract_specifications(products)
+    except Exception as e:
+        logger.error(f"Error extracting specifications during ranking: {e}")
+        # Continue without specifications if extraction fails
     
     # Initial score assignment based on available data
     for product in products:
@@ -296,10 +392,16 @@ def rank_products(products, user_query, max_price=None):
         if p.get('reviews'):
             product_info += f"Reviews: {p['reviews']}\n"
             
+        # Add specifications if available
+        if p.get('specifications') and isinstance(p['specifications'], dict) and p['specifications']:
+            product_info += "Specifications:\n"
+            for key, value in list(p['specifications'].items())[:5]:  # Limit to top 5 specs
+                product_info += f"- {key}: {value}\n"
+        
         # Truncate details to reduce token usage
         details = p.get('details', '')
         if details and details != "No details found.":
-            details_snippet = details[:500] + "..." if len(details) > 500 else details
+            details_snippet = details[:300] + "..." if len(details) > 300 else details
             product_info += f"Details: {details_snippet}\n\n"
         
         products_details.append(product_info)
@@ -375,17 +477,25 @@ Do NOT include any introductory text or conclusion, just the product scores and 
         
         detailed_prompt = f"""The user searched for: "{user_query}"
 
-For each of these top products, write a helpful explanation (2-3 sentences) about why it would be a good match for the user's query.
-Focus on specific features, value proposition, and how well it addresses the user's needs.
+I need you to analyze these products in relation to the search query: "{user_query}"
 
-{products_text[:5000]}  # Limit text to avoid token limits
+For each product, provide:
+1. A specific recommendation explanation (3-4 sentences) highlighting why this would be a good choice for the user
+2. Key pros and cons (3 pros, 2 cons)
 
 Format your response as:
 PRODUCT 1 DESCRIPTION:
-[Your explanation here]
+[Your detailed explanation here]
+
+PRODUCT 1 PROS AND CONS:
++ [Pro 1]
++ [Pro 2]
++ [Pro 3]
+- [Con 1]
+- [Con 2]
 
 PRODUCT 2 DESCRIPTION:
-[Your explanation here]
+[Your detailed explanation here]
 ...
 
 After all product descriptions, add a section titled "TOP RECOMMENDATIONS:" where you highlight the 1-3 best products and explain why they stand out as the top choices (3-4 sentences).
@@ -413,14 +523,38 @@ After all product descriptions, add a section titled "TOP RECOMMENDATIONS:" wher
             # Extract individual product descriptions
             products_desc_blocks = re.split(r'PRODUCT \d+ DESCRIPTION:', product_descriptions_part)
             for i, desc_block in enumerate(products_desc_blocks[1:], 1):  # Skip the first empty split
-                descriptions[i] = desc_block.strip()
+                # Split by "PRODUCT X PROS AND CONS:" to separate description from pros/cons
+                if "PRODUCT" in desc_block and "PROS AND CONS:" in desc_block:
+                    desc_parts = desc_block.split("PRODUCT")
+                    description = desc_parts[0].strip()
+                    descriptions[i] = description
+                else:
+                    descriptions[i] = desc_block.strip()
             
-            # Add descriptions to products
+            # Extract pros and cons
+            pros_cons = {}
+            pros_cons_blocks = re.findall(r'PRODUCT \d+ PROS AND CONS:([\s\S]*?)(?=PRODUCT \d+|TOP RECOMMENDATIONS:|$)', product_descriptions_part)
+            for i, pc_block in enumerate(pros_cons_blocks, 1):
+                pros = re.findall(r'\+\s*(.*)', pc_block)
+                cons = re.findall(r'-\s*(.*)', pc_block)
+                pros_cons[i] = {
+                    "pros": pros,
+                    "cons": cons
+                }
+            
+            # Add descriptions and pros/cons to products
             for idx, product in enumerate(top_products, 1):
                 if idx in descriptions:
                     product["detailed_description"] = descriptions[idx]
                 else:
                     product["detailed_description"] = f"This {product['title']} appears to be a good match for your search."
+                
+                if idx in pros_cons:
+                    product["pros"] = pros_cons[idx]["pros"]
+                    product["cons"] = pros_cons[idx]["cons"]
+                else:
+                    product["pros"] = []
+                    product["cons"] = []
             
             # Spread descriptions to other products with similar titles
             for product in filtered_products:
@@ -429,11 +563,15 @@ After all product descriptions, add a section titled "TOP RECOMMENDATIONS:" wher
                     for described_product in top_products:
                         if described_product.get("detailed_description") and similar_titles(product['title'], described_product['title']):
                             product["detailed_description"] = described_product["detailed_description"]
+                            product["pros"] = described_product.get("pros", [])
+                            product["cons"] = described_product.get("cons", [])
                             break
                     
                     # If still no description, create a generic one
                     if not product.get("detailed_description"):
                         product["detailed_description"] = f"This product appears to match your search for '{user_query}'."
+                        product["pros"] = ["Matches your search criteria"]
+                        product["cons"] = ["Limited information available"]
             
             # Create top recommendations object
             # Sort by score for final ranking
@@ -463,6 +601,30 @@ After all product descriptions, add a section titled "TOP RECOMMENDATIONS:" wher
         
         # Clean up temporary fields
         for product in filtered_products:
+            # Build specifications from pros and cons if not already present
+            if not product.get('specifications') or not product['specifications']:
+                product['specifications'] = {}
+                
+                # Add pros and cons to specifications
+                if product.get('pros') or product.get('cons'):
+                    pros_text = "\n".join([f"+ {pro}" for pro in product.get('pros', [])])
+                    cons_text = "\n".join([f"- {con}" for con in product.get('cons', [])])
+                    
+                    if pros_text or cons_text:
+                        product['specifications']['Pros & Cons'] = f"{pros_text}\n{cons_text}"
+                    
+                # Create key features from rank reason if available
+                if product.get('rank_reason'):
+                    product['specifications']['Key Features'] = product['rank_reason']
+                
+                # Add dummy specs if nothing else available
+                if not product['specifications']:
+                    product['specifications'] = {
+                        "Product": product.get('title', 'Unknown'),
+                        "Price": product.get('price', 'Not specified'),
+                        "Rating": product.get('rating', 'Not rated')
+                    }
+            
             # Remove scoring fields that shouldn't be in the final output
             fields_to_remove = ['score', 'price_score', 'price_numeric', 'llm_score', 'filtered_by_price']
             for field in fields_to_remove:
@@ -481,10 +643,18 @@ After all product descriptions, add a section titled "TOP RECOMMENDATIONS:" wher
                     del product[field]
             
             # Add missing fields
-            if not product.get("rank_reason"):
-                product["rank_reason"] = "Product appears to match your search criteria."
+            if not product.get("rank_reason") or len(product.get("rank_reason", "")) < 10:
+                product["rank_reason"] = f"This product matches your search criteria for '{user_query}'."
             if not product.get("detailed_description"):
-                product["detailed_description"] = f"This product matches your search for '{user_query}'."
+                product["detailed_description"] = f"This product appears to be relevant to your search for '{user_query}'."
+            
+            # Make sure specifications exist
+            if not product.get("specifications") or not isinstance(product["specifications"], dict):
+                product["specifications"] = {
+                    "Product": product.get("title", "Unknown"),
+                    "Price": product.get("price", "Not specified"),
+                    "Rating": product.get("rating", "Not rated")
+                }
             
         # Simple sorting by rating as fallback
         try:

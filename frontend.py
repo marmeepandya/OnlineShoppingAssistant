@@ -59,8 +59,8 @@ if st.button("Search") and query:
             max_price = 10000
             st.warning("Invalid price input. Defaulting to €10,000.")
         
+        # Debug: Extract specifications separately for better visualization
         product_details = extract_specifications(serp_results)
-        st.write(json.dumps(product_details, indent=2, ensure_ascii=False))
         progress_bar.progress(60)
         
         # Stage 3: Ranking and recommendations
@@ -104,7 +104,16 @@ if st.button("Search") and query:
                                 st.write(f"**Price**: {product.get('price', 'N/A')}")
                                 if product.get("rating"):
                                     st.write(f"**Rating**: {product['rating']} ⭐️")
-                                st.markdown(f"**Why we recommend it**: {product.get('rank_reason', 'No reason provided.')}")
+                                st.markdown(f"**Why we recommend it**: {product.get('rank_reason', 'This product matches your search criteria.')}")
+                                
+                                # Show pros and cons if available
+                                if product.get("pros") or product.get("cons"):
+                                    st.write("**Pros & Cons**:")
+                                    for pro in product.get("pros", []):
+                                        st.markdown(f"✅ {pro}")
+                                    for con in product.get("cons", []):
+                                        st.markdown(f"⚠️ {con}")
+                                        
                                 st.write(f"[View Product]({product['url']})")
             
             # Display all results with detailed descriptions
@@ -125,16 +134,46 @@ if st.button("Search") and query:
                         st.write(f"[View Product]({r['url']})")
                 
                 # Show product analysis below image and basic info
-                st.markdown(f"**Why this product made the list**: {r.get('detailed_description', 'No detailed description available.')}")
+                st.markdown(f"**Why this product made the list**: {r.get('rank_reason', 'This product matches your search criteria.')}")
                 
-                # Show specifications in an expander
-                if r.get("specifications") or r.get("details"):
+                # Enhanced specifications display with fallback options
+                if r.get("specifications") and isinstance(r.get("specifications"), dict) and r.get("specifications"):
                     with st.expander("Show Specifications"):
-                        if r.get("specifications"):
-                            for key, value in r["specifications"].items():
-                                st.markdown(f"- **{key.capitalize()}**: {value}")
-                        elif r.get("details"):
-                            st.markdown(r["details"])
+                        for key, value in r["specifications"].items():
+                            if isinstance(value, str) and value.startswith("+") or value.startswith("-"):
+                                # This is likely a pros/cons list, format accordingly
+                                st.markdown(f"**{key}**:")
+                                for line in value.split("\n"):
+                                    if line.strip():
+                                        if line.strip().startswith("+"):
+                                            st.markdown(f"✅ {line.strip()[1:].strip()}")
+                                        elif line.strip().startswith("-"):
+                                            st.markdown(f"⚠️ {line.strip()[1:].strip()}")
+                                        else:
+                                            st.markdown(f"• {line.strip()}")
+                            else:
+                                st.markdown(f"**{key.capitalize()}**: {value}")
+                elif r.get("pros") or r.get("cons"):
+                    # Fallback to showing pros and cons directly
+                    with st.expander("Show Specifications"):
+                        if r.get("pros"):
+                            st.markdown("**Pros:**")
+                            for pro in r["pros"]:
+                                st.markdown(f"✅ {pro}")
+                        if r.get("cons"):
+                            st.markdown("**Cons:**")
+                            for con in r["cons"]:
+                                st.markdown(f"⚠️ {con}")
+                        # Add basic details
+                        st.markdown(f"**Price**: {r.get('price', 'N/A')}")
+                        if r.get("rating"):
+                            st.markdown(f"**Rating**: {r['rating']}")
+                        if r.get("detailed_description"):
+                            st.markdown(f"**Details**: {r['detailed_description']}")
+                elif r.get("details"):
+                    # Last resort fallback
+                    with st.expander("Show Specifications"):
+                        st.markdown(r["details"][:500] + "..." if len(r["details"]) > 500 else r["details"])
                 
                 st.markdown("---")
 
