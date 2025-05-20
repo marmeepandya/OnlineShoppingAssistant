@@ -8,9 +8,9 @@ import functools
 import concurrent.futures
 from tavily import TavilyClient
 from dotenv import load_dotenv
-import serpapi
 from cachetools import cached, TTLCache
 from langchain_community.tools.tavily_search import TavilySearchResults
+from serpapi import GoogleSearch
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -22,26 +22,31 @@ tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 serpapi_key = os.getenv("SERPAPI_KEY")
 
 # Consolidated query processing function that replaces 4 separate LLM calls
-def process_query(query):
+def process_query(query, max_price=None):
     """Process a user query in a single LLM call instead of multiple sequential calls"""
-    prompt = f"""Analyze this shopping query thoroughly: "{query}"
-
-    1. If not in English, translate to English (if already English, just repeat it).
-    2. Restructure for product search (make it concise, clear, specific).
-    3. Is this a comparison query? Answer only yes/no (looking for terms like "vs", "compare", "better", "difference").
-    4. Is this a recommendation query? Answer only yes/no (looking for terms like "suggest", "recommend", "best for me").
+    prompt = f"""Translate and restructure this shopping query: "{query} under {max_price} euros"
 
     Format your response exactly as follows:
     Translated: [translated text]
     Restructured: [restructured query]
-    Comparison: [yes/no]
-    Recommendation: [yes/no]
     """
 
     try:
         response = ollama.chat(model="llama3.1", messages=[
-            {"role": "system", "content": "You are a precise query analysis assistant."},
-            {"role": "user", "content": prompt}
+            {"role": "system", "content": """You are an AI assistant that restructures user queries for product searches. 
+             Make the query more specific. If the qeury is not in English, translate it to English.
+             
+             Example:
+             Query: "I want to buy a new phone under 500 euros"
+             Restructured: "phone under 500 euros"
+             Query: "Air fryer under 100 euros"
+             Restructured: "Air fryer under 100 euros"
+             
+             Format your response exactly as follows:
+             Translated: [translated text]
+             Restructured: [restructured query]
+             """},
+            {"role": "user", "content": f'Translate and restructure this shopping query: "{query} under {max_price} euros"'}
         ])
 
         result = response['message']['content']
@@ -49,14 +54,10 @@ def process_query(query):
         # Parse the response
         translated = re.search(r"^Translated: (.+)$", result, re.MULTILINE)
         restructured = re.search(r"^Restructured: (.+)$", result, re.MULTILINE)
-        comparison = re.search(r"^Comparison: (.+)$", result, re.MULTILINE)
-        recommendation = re.search(r"^Recommendation: (.+)$", result, re.MULTILINE)
-
+        
         processed_query = {
             "translated": translated.group(1) if translated else query,
             "restructured": restructured.group(1) if restructured else query,
-            "is_comparison": "yes" in comparison.group(1).lower() if comparison else False,
-            "is_recommendation": "yes" in recommendation.group(1).lower() if recommendation else False
         }
 
         return processed_query
@@ -67,8 +68,6 @@ def process_query(query):
         return {
             "translated": query,
             "restructured": query,
-            "is_comparison": False,
-            "is_recommendation": False
         }
 
 # Modified search_serpapi function that includes validation
@@ -89,14 +88,14 @@ def search_serpapi(query):
             "api_key": serpapi_key,
             "engine": "google_shopping",
             "q": query,
-            #"num": 20, 
-            "gl": "de",
-            "tbm": "shop",
+            "num": 20, 
+            "google_domain": "google.com",
+            "location": "Germany",
+            "hl": "en",  # Language set to English
         }
 
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            future = executor.submit(lambda: serpapi.search(params))
-            results = future.result().as_dict()
+        search = GoogleSearch(params)
+        results = search.get_dict()
 
         product_results = results.get("shopping_results", [])
         
@@ -165,7 +164,7 @@ def extract_specifications(products):
     
     return detailed_products
 
-def extract_specifications(products):
+'''def extract_specifications(products):
     """
     Extract structured specifications from product details.
     Parses text to find key product features and specifications.
@@ -252,7 +251,7 @@ If you can't find a specific specification, don't include that key in the JSON.
             logger.error(f"Error extracting specifications: {e}")
             product['specifications'] = {}
     
-    return products
+    return products'''
 
 def rank_products(products, user_query, max_price=None):
     """
@@ -285,26 +284,29 @@ def rank_products(products, user_query, max_price=None):
         logger.error(f"Error extracting specifications during ranking: {e}")
         # Continue without specifications if extraction fails
     
+    # Filter out products above max_price first
+    if max_price is not None:
+        filtered_products = []
+        for product in products:
+            try:
+                if product.get('price'):
+                    # Convert price to float, handling different price formats
+                    price_str = str(product['price']).replace('€', '').replace(',', '').strip()
+                    price_value = float(re.sub(r'[^\d.]', '', price_str))
+                    if price_value <= max_price:
+                        filtered_products.append(product)
+                else:
+                    # If no price available, include the product
+                    filtered_products.append(product)
+            except (ValueError, TypeError):
+                # If price conversion fails, include the product
+                filtered_products.append(product)
+        products = filtered_products
+    
     # Initial score assignment based on available data
     for product in products:
         # Start with base score
         product['score'] = 50
-        
-        # Convert price to float for comparison and scoring
-        try:
-            if product.get('price'):
-                price_value = float(re.sub(r'[^\d.]', '', str(product['price'])))
-                product['price_numeric'] = price_value
-                
-                # Price-based scoring (lower price = higher score, max 20 points)
-                # We'll normalize this later when we know the price range
-                product['price_score'] = price_value
-            else:
-                product['price_numeric'] = None
-                product['price_score'] = 0
-        except (ValueError, TypeError):
-            product['price_numeric'] = None
-            product['price_score'] = 0
         
         # Rating-based scoring (up to 20 points)
         if product.get('rating'):
@@ -338,30 +340,9 @@ def rank_products(products, user_query, max_price=None):
             detail_points = min(detail_length / 100, 10)  # 1 point per 100 chars, max 10
             product['score'] += detail_points
     
-    # If we have price data, normalize the price scores across products
-    products_with_price = [p for p in products if p.get('price_numeric') is not None]
-    if products_with_price:
-        min_price = min(p['price_numeric'] for p in products_with_price)
-        max_price = max(p['price_numeric'] for p in products_with_price)
-        
-        if max_price > min_price:
-            price_range = max_price - min_price
-            for product in products_with_price:
-                # Invert and normalize: lower prices get higher scores
-                # 20 points for lowest price, scaled down for higher prices
-                normalized_price_score = 20 * (1 - (product['price_numeric'] - min_price) / price_range)
-                product['score'] += normalized_price_score
-    
     # Prepare subset of products for LLM analysis - select all products but limit text length
     filtered_products = []
     for product in products:
-        # Only apply price filter if explicitly specified
-        if max_price is not None and product.get('price_numeric') is not None:
-            if product['price_numeric'] > max_price:
-                # Mark as filtered but keep in the results
-                product['filtered_by_price'] = True
-                product['score'] -= 30  # Penalty for exceeding price limit
-                
         # Make sure we have basic info needed for display
         if product.get('title'):
             filtered_products.append(product)
@@ -408,34 +389,28 @@ def rank_products(products, user_query, max_price=None):
     
     products_text = "\n".join(products_details)
     
-    prompt = f"""Original query: "{user_query}"
+    prompt = f"""Original query: "{user_query}".
 
-I need you to analyze these products and rank them based on how well they match the query.
-Consider:
-1. Relevance to the query "{user_query}"
-2. Quality (ratings and reviews)
-3. Value for money
-4. Features and specifications
+            Products to analyze: {products_text}
 
-Here are the products to analyze:
-
-{products_text}
-
-For each product, assign:
-1. A relevance score from 1-10 where 10 is perfect match to query
-2. A brief justification for this score (1-2 sentences)
-
-Format your response with the product number followed by the score and justification:
-Product 1: Score X - [justification]
-Product 2: Score Y - [justification]
-...
-
-Do NOT include any introductory text or conclusion, just the product scores and justifications.
-"""
+            """
 
     try:
         response = ollama.chat(model="llama3.1", messages=[
-            {"role": "system", "content": "You are a product ranking assistant focused on accurately matching products to user needs."},
+            {"role": "system", "content": """You are a product ranking assistant focused on accurately matching products to user needs.
+             You are given a user query and a list of products. You need to rank the products based on how well they match the query.
+             I need you to analyze these products and rank them based on how well they match the query.
+            Consider:
+            1. Relevance to the original query
+            2. Quality (ratings and reviews)
+            3. Value for money
+            4. Features and specifications
+            
+            Format your response with the product number followed by the score and justification:
+            Product 1: Score X - [justification]
+            Product 2: Score Y - [justification]
+            
+             """},
             {"role": "user", "content": prompt}
         ])
 
@@ -473,37 +448,33 @@ Do NOT include any introductory text or conclusion, just the product scores and 
                 product["rank_reason"] = "No specific ranking information available."
         
         # Now generate detailed descriptions for top products
-        top_products = top_products_for_analysis[:5]  # Take top 5 for detailed descriptions
+        top_products = top_products_for_analysis # Take top 5 for detailed descriptions
         
         detailed_prompt = f"""The user searched for: "{user_query}"
 
-I need you to analyze these products in relation to the search query: "{user_query}"
-
-For each product, provide:
-1. A specific recommendation explanation (3-4 sentences) highlighting why this would be a good choice for the user
-2. Key pros and cons (3 pros, 2 cons)
-
-Format your response as:
-PRODUCT 1 DESCRIPTION:
-[Your detailed explanation here]
-
-PRODUCT 1 PROS AND CONS:
-+ [Pro 1]
-+ [Pro 2]
-+ [Pro 3]
-- [Con 1]
-- [Con 2]
-
-PRODUCT 2 DESCRIPTION:
-[Your detailed explanation here]
-...
-
-After all product descriptions, add a section titled "TOP RECOMMENDATIONS:" where you highlight the 1-3 best products and explain why they stand out as the top choices (3-4 sentences).
-"""
+                        I need you to analyze these products in relation to the search query: "{top_products}"
+                        """
         
         try:
             detailed_response = ollama.chat(model="llama3.1", messages=[
-                {"role": "system", "content": "You are a product recommendation expert who provides concise, helpful product analyses."},
+                {"role": "system", "content": """You are a product recommendation expert who provides concise, helpful product analyses.
+                 You are given a user query and a list of products. You need to analyze the products and provide a detailed explanation of why they are the best choices for the user, 
+                 along with their pros and cons.
+                 
+                 Format your response as:
+                 
+                 PRODUCT 1 DESCRIPTION:
+                 [Why this product is a good fit for the user's query]
+
+                 PRODUCT 1 PROS AND CONS:
+                 + [Pro 1]
+                 + [Pro 2]
+                 + [Pro 3]
+                 - [Con 1]
+                 - [Con 2]
+                 
+                 After all product descriptions, add a section titled "TOP RECOMMENDATIONS:" where you highlight the 1-3 best products and explain why they stand out as the top choices (3-4 sentences).
+                 """},
                 {"role": "user", "content": detailed_prompt}
             ])
             
