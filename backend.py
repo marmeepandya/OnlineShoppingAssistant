@@ -4,13 +4,19 @@ import json
 import ollama
 import time
 import logging
-import functools
-import concurrent.futures
+import pandas as pd
+from datetime import datetime
+from typing import List, Dict, Any, Optional, TypedDict, Annotated
 from tavily import TavilyClient
 from dotenv import load_dotenv
 from cachetools import cached, TTLCache
 from langchain_community.tools.tavily_search import TavilySearchResults
 from serpapi import GoogleSearch
+from langgraph.graph import Graph, END
+from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -21,829 +27,854 @@ load_dotenv()
 tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 serpapi_key = os.getenv("SERPAPI_KEY")
 
-# Consolidated query processing function that replaces 4 separate LLM calls
-def process_query(query, max_price=None):
-    """Process a user query in a single LLM call instead of multiple sequential calls"""
-    prompt = f"""Translate and restructure this shopping query: "{query} under {max_price} euros"
+class ProductState(TypedDict):
+    """State for the shopping assistant workflow"""
+    query: str
+    max_price: Optional[float]
+    additional_requirements: str  
+    products: List[Dict[str, Any]]
+    processed_query: Dict[str, str]
+    detailed_products: List[Dict[str, Any]]
+    ranked_products: List[Dict[str, Any]]
+    recommendations: List[Dict[str, Any]]
+    recommendations_analysis: str
+    status: Dict[str, str]
 
-    Format your response exactly as follows:
-    Translated: [translated text]
-    Restructured: [restructured query]
-    """
-
-    try:
-        response = ollama.chat(model="llama3.1", messages=[
-            {"role": "system", "content": """You are an AI assistant that restructures user queries for product searches. 
-             Make the query more specific. If the qeury is not in English, translate it to English.
-             
-             Example:
-             Query: "I want to buy a new phone under 500 euros"
-             Restructured: "phone under 500 euros"
-             Query: "Air fryer under 100 euros"
-             Restructured: "Air fryer under 100 euros"
-             
-             Format your response exactly as follows:
-             Translated: [translated text]
-             Restructured: [restructured query]
-             """},
-            {"role": "user", "content": f'Translate and restructure this shopping query: "{query} under {max_price} euros"'}
-        ])
-
-        result = response['message']['content']
-
-        # Parse the response
-        translated = re.search(r"^Translated: (.+)$", result, re.MULTILINE)
-        restructured = re.search(r"^Restructured: (.+)$", result, re.MULTILINE)
+class ShoppingGraph:
+    def __init__(self):
+        self.graph = self._build_graph()
+        self.product_cache = TTLCache(maxsize=100, ttl=3600)  # Cache for 1 hour
         
-        processed_query = {
-            "translated": translated.group(1) if translated else query,
-            "restructured": restructured.group(1) if restructured else query,
-        }
-
-        return processed_query
-
-    except Exception as e:
-        logger.error(f"Error processing query: {e}")
-        # Fallback response
-        return {
-            "translated": query,
-            "restructured": query,
-        }
-
-# Modified search_serpapi function that includes validation
-def search_serpapi(query):
-    """
-    Search for products with caching, timeout, and validation.
-    Limits the number of products returned to improve performance.
+    def _build_graph(self) -> Graph:
+        """Build the LangGraph workflow"""
+        # Define the nodes
+        workflow = Graph()
+        
+        # Add nodes for each step in the workflow
+        workflow.add_node("process_query", self._process_query_node)
+        workflow.add_node("search_products", self._search_products_node)
+        workflow.add_node("extract_specifications", self._extract_specifications_node)
+        workflow.add_node("rank_products", self._rank_products_node)
+        workflow.add_node("generate_recommendations", self._generate_recommendations_node)
+                
+        # Define the edges
+        workflow.add_edge("process_query", "search_products")
+        workflow.add_edge("search_products", "extract_specifications")
+        workflow.add_edge("extract_specifications", "rank_products")
+        workflow.add_edge("rank_products", "generate_recommendations")
+        workflow.add_edge("generate_recommendations", END)  # Add direct edge to end
+        
+        # Set the entry point
+        workflow.set_entry_point("process_query")
+        
+        return workflow.compile()
     
-    Args:
-        query (str): The search query
-        limit (int): Maximum number of products to return (default: 5)
-        
-    Returns:
-        list: Limited list of product dictionaries
-    """
-    try:
-        params = {
-            "api_key": serpapi_key,
-            "engine": "google_shopping",
-            "q": query,
-            "num": 20, 
-            "google_domain": "google.com",
-            "location": "Germany",
-            "hl": "en",  # Language set to English
-        }
+    async def _process_query_node(self, state: ProductState) -> ProductState:
+        """Process and restructure the user query with additional requirements"""
+        try:
+            # Create the prompt
+            prompt = f"""You are an AI assistant that restructures user queries for product searches. 
+            Your task is to create a detailed search query that includes ALL requirements and price limit.
+            
+            Basic Query: {state['query']}
+            Max Price: {state['max_price']} euros
+            Additional Requirements: {state['additional_requirements']}
+            
+            Please provide your response in the following format:
+            Translated: [translated query if needed]
+            Restructured: [restructured query incorporating additional requirements and price limit]
+            
+            CRITICAL RULES:
+            1. ALWAYS include the price limit in the restructured query
+            2. ALWAYS include ALL additional requirements in the restructured query
+            3. Make the query specific and search-friendly
+            4. Keep the query concise but informative
+            5. For technical specifications (RAM, storage, etc.), add them AFTER the main product
+            6. For product type modifiers (Gaming, Professional, etc.), add them BEFORE the main product
+            7. Use natural language that search engines understand
+            8. Make sure that there are no repetitive phrases
+            
+            Examples:
+            Query: Laptop
+            Max Price: 1000 euros
+            Additional Requirements: 16GB RAM, Gaming
+            Restructured: Gaming Laptop with 16GB RAM under 1000 euros
+            
+            Query: Laptop
+            Max Price: 4000 euros
+            Additional Requirements: Gaming
+            Restructured: Gaming Laptop under 4000 euros
+            
+            Query: Washing Machine
+            Max Price: 800 euros
+            Additional Requirements: 
+            Restructured: Washing Machine under 800 euros
+            
+            Query: Smartphone
+            Max Price: 500 euros
+            Additional Requirements: 5G, 128GB
+            Restructured: 5G Smartphone with 128GB storage under 500 euros
+            
+            Query: Monitor
+            Max Price: 300 euros
+            Additional Requirements: 27 inch, 4K
+            Restructured: 27 inch 4K Monitor under 300 euros
+            
+            Query: Headphones
+            Max Price: 200 euros
+            Additional Requirements: Wireless, Noise Cancelling
+            Restructured: Wireless Noise Cancelling Headphones under 200 euros
+            
+            Query: Camera
+            Max Price: 1000 euros
+            Additional Requirements: DSLR, 24MP
+            Restructured: DSLR Camera with 24MP under 1000 euros
+            
+            Query: Printer
+            Max Price: 150 euros
+            Additional Requirements: Wireless, Color
+            Restructured: Wireless Color Printer under 150 euros"""
+            
+            # Call Ollama directly
+            response = ollama.chat(model='llama3.1', messages=[
+                {
+                    'role': 'user',
+                    'content': prompt
+                }
+            ])
+            
+            result = response['message']['content']
+            
+            # Extract translated and restructured queries
+            translated = re.search(r"^Translated: (.+)$", result, re.MULTILINE)
+            restructured = re.search(r"^Restructured: (.+)$", result, re.MULTILINE)
+            
+            # Ensure price is included in restructured query
+            final_restructured = restructured.group(1) if restructured else state["query"]
+            
+            # Ensure additional requirements are included
+            if state["additional_requirements"] and state["additional_requirements"].strip():
+                requirements = state["additional_requirements"].strip()
+                if requirements.lower() not in final_restructured.lower():
+                    # Add requirements at the beginning of the query
+                    final_restructured = f"{requirements} {final_restructured}"
+            
+            # Ensure price is included
+            if state["max_price"] and f"{state['max_price']} euros" not in final_restructured.lower():
+                final_restructured = f"{final_restructured} under {state['max_price']} euros"
+            
+            state["processed_query"] = {
+                "translated": translated.group(1) if translated else state["query"],
+                "restructured": final_restructured,
+                "original_requirements": state["additional_requirements"]
+            }
+            
+            state["status"] = {
+                "process_query": "Completed",
+                "search_products": "Pending",
+                "extract_specifications": "Pending",
+                "rank_products": "Pending",
+                "generate_recommendations": "Pending"
+            }
+            
+            return state
+            
+        except Exception as e:
+            logger.error(f"Error in process_query_node: {e}")
+            state["processed_query"] = {
+                "translated": state["query"],
+                "restructured": state["query"],
+                "original_requirements": state["additional_requirements"]
+            }
+            state["status"] = {
+                "process_query": f"Failed: {str(e)}",
+                "search_products": "Pending",
+                "extract_specifications": "Pending",
+                "rank_products": "Pending",
+                "generate_recommendations": "Pending"
+            }
+            return state
+    
+    async def _search_products_node(self, state: ProductState) -> ProductState:
+        """Search for products using SerpAPI"""
+        try:
+            params = {
+                "api_key": serpapi_key,
+                "engine": "google_shopping",
+                "q": state["processed_query"]["restructured"],
+                "num": 20,
+                "location": "Germany",
+                "gl": "de",
+                "hl": "en",
+            }
 
-        search = GoogleSearch(params)
-        results = search.get_dict()
+            search = GoogleSearch(params)
+            results = search.get_dict()
+            product_results = results.get("shopping_results", [])[:20]
 
-        product_results = results.get("shopping_results", [])
-        
-        # Ensure we don't exceed the requested limit
-        # product_results = product_results[:50]
+            products = []
+            for r in product_results:
+                # Get price directly without conversion
+                price = r.get('extracted_price', '')
+                if price and isinstance(price, (int, float)):
+                    price = f"€{price:.2f}"
+                else:
+                    price = f"€{price}" if price else 'N/A'
 
-        products = []
-        for r in product_results:
-            products.append({
-                "product_id": r.get('product_id', ''),
-                "title": r.get('title', ''),
-                "url": r.get('product_link', ''),
-                "source": r.get('source', ''),
-                "price": r.get('extracted_price', ''),
-                "old_price": r.get('extracted_old_price', ''),
-                "rating": r.get('rating', ''),
-                "reviews": r.get('reviews', ''),
-                "extensions": r.get('extensions', []),
-                "image": r.get('thumbnail', ''),
-            })
-        
-        logger.info(f"Successfully retrieved {len(products)} products from SerpAPI")
-        return products
+                # Format reviews to preserve exact number
+                reviews = r.get('reviews', '')
+                if reviews and isinstance(reviews, (int, float)):
+                    reviews = str(int(reviews))  # Convert to integer and then string to remove decimal places
+                elif not reviews:
+                    reviews = 'N/A'
 
-    except Exception as e:
-        logger.error(f"Error in search: {e}")
-        return []
+                product = {
+                    "product_id": r.get('product_id', ''),
+                    "title": r.get('title', ''),
+                    "url": r.get('product_link', ''),
+                    "source": r.get('source', ''),
+                    "price": price,
+                    "old_price": r.get('extracted_old_price', ''),
+                    "rating": r.get('rating', ''),
+                    "reviews": reviews,
+                    "extensions": r.get('extensions', []),
+                    "image": r.get('thumbnail', ''),
+                    "processed_query": state["processed_query"]  # Add the processed query to each product
+                }
+                products.append(product)
+            
+            state["products"] = products
+            state["status"]["search_products"] = f"Completed: Found {len(products)} products"
+            state["status"]["extract_specifications"] = "Pending"
+            
+            return state
 
-def extract_specifications(products):
-    detailed_products = []
-    tool = TavilySearchResults(
+        except Exception as e:
+            logger.error(f"Error in search: {e}")
+            state["products"] = []
+            state["status"]["search_products"] = f"Failed: {str(e)}"
+            state["status"]["extract_specifications"] = "Pending"
+            return state
+    
+    async def _extract_specifications_node(self, state: ProductState) -> ProductState:
+        """Extract and structure product specifications using Tavily and LLM"""
+        tool = TavilySearchResults(
             max_results=2,
             search_depth="advanced",
             include_answer=True,
             include_raw_content=True
-    )
-    for product in products:
-        try:
-            search_query = f"{product['title']} product technical description details"
-            details = tool.invoke(search_query)
-            
-            # The error is here - details appears to be a list of strings, not dictionaries
-            # Let's properly handle the different possible response formats
-            content = ""
-            if details and isinstance(details, list):
-                for item in details:
-                    if isinstance(item, dict) and 'content' in item:
-                        content += item['content'] + '\n'
-                    elif isinstance(item, str):
-                        content += item + '\n'
-            
-            # If we couldn't extract any content, use a placeholder
-            if not content:
-                content = "No details found."
-                
-            detailed_products.append({
-                **product,
-                "details": content
-            })
-        except Exception as e:
-            logger.error(f"Error extracting specifications for product {product.get('title')}: {e}")
-            detailed_products.append({
-                **product,
-                "details": "No details found."
-            })
-    
-    return detailed_products
-
-'''def extract_specifications(products):
-    """
-    Extract structured specifications from product details.
-    Parses text to find key product features and specifications.
-    
-    Args:
-        products (list): List of product dicts with a 'details' field
+        )
         
-    Returns:
-        list: Updated product list with extracted specifications
-    """
-    import re
-    import ollama
-    import logging
-    
-    logger = logging.getLogger(__name__)
-    
-    for product in products:
-        if not product.get('details') or product['details'] == "No details found.":
-            product['specifications'] = {}
-            continue
-            
-        # Truncate details to reduce token usage
-        details = product.get('details', '')
-        details_snippet = details[:1500] + "..." if len(details) > 1500 else details
-        
-        prompt = f"""Extract key product specifications from this product description as key-value pairs:
-
-{details_snippet}
-
-Look for technical specifications like:
-- Dimensions/size
-- Weight
-- Color options
-- Material
-- Battery life
-- Storage/memory
-- Connectivity options
-- Key features
-- Any other important technical specs
-
-Format your response EXACTLY as a JSON object with specification name as key and value as value.
-Example:
-{{
-  "dimensions": "5.8 x 2.8 x 0.3 inches",
-  "weight": "6.07 ounces",
-  "battery": "Up to 17 hours",
-  "storage": "128GB"
-}}
-
-If you can't find a specific specification, don't include that key in the JSON.
-"""
-
-        try:
-            response = ollama.chat(model="llama3.1", messages=[
-                {"role": "system", "content": "You extract structured product specifications."},
-                {"role": "user", "content": prompt}
-            ])
-            
-            # Extract JSON from response
-            spec_text = response['message']['content'].strip()
-            
-            # Find JSON block in the response
-            json_match = re.search(r'({[\s\S]*?})', spec_text)
-            if json_match:
-                spec_text = json_match.group(1)
-            
-            # Try to parse the JSON
+        detailed_products = []
+        for product in state["products"]:
             try:
-                import json
-                specs = json.loads(spec_text)
-                product['specifications'] = specs
-            except json.JSONDecodeError:
-                # Fallback: Extract key-value pairs using regex
-                specs = {}
-                lines = spec_text.split('\n')
-                for line in lines:
-                    kv_match = re.search(r'"([^"]+)":\s*"([^"]+)"', line)
-                    if kv_match:
-                        key, value = kv_match.groups()
-                        specs[key] = value
-                product['specifications'] = specs
+                # First search for general product information
+                search_query = f"{product['title']} product technical description details specifications features pros cons"
+                details = tool.invoke(search_query)
                 
-        except Exception as e:
-            logger.error(f"Error extracting specifications: {e}")
-            product['specifications'] = {}
-    
-    return products'''
-
-def rank_products(products, user_query, max_price=None):
-    """
-    Rank products using a point-based system and LLaMA 3 for analysis.
-    Extracts specifications and provides detailed recommendation reasons.
-    
-    Args:
-        products (list): List of product dicts with fields like title, price, rating, content
-        user_query (str): The original user search query
-        max_price (int, optional): Maximum price constraint set by the user
-        
-    Returns:
-        tuple: (ranked_products, top_recommendations)
-            - ranked_products: List of ranked product dicts
-            - top_recommendations: Dict with information about the top 1-3 recommended products
-    """
-    import re
-    import logging
-    import ollama
-    
-    logger = logging.getLogger(__name__)
-    
-    if not products:
-        return [], {"text": "No products found.", "products": []}
-    
-    # Extract specifications before ranking to use in analysis
-    try:
-        products = extract_specifications(products)
-    except Exception as e:
-        logger.error(f"Error extracting specifications during ranking: {e}")
-        # Continue without specifications if extraction fails
-    
-    # Filter out products above max_price first
-    if max_price is not None:
-        filtered_products = []
-        for product in products:
-            try:
-                if product.get('price'):
-                    # Convert price to float, handling different price formats
-                    price_str = str(product['price']).replace('€', '').replace(',', '').strip()
-                    price_value = float(re.sub(r'[^\d.]', '', price_str))
-                    if price_value <= max_price:
-                        filtered_products.append(product)
-                else:
-                    # If no price available, include the product
-                    filtered_products.append(product)
-            except (ValueError, TypeError):
-                # If price conversion fails, include the product
-                filtered_products.append(product)
-        products = filtered_products
-    
-    # Initial score assignment based on available data
-    for product in products:
-        # Start with base score
-        product['score'] = 50
-        
-        # Rating-based scoring (up to 20 points)
-        if product.get('rating'):
-            try:
-                rating_value = float(str(product['rating']).split()[0])
-                # Convert 5-star rating to points (5 stars = 20 points)
-                product['score'] += min(rating_value * 4, 20)
-            except (ValueError, IndexError):
-                pass
-        
-        # Review count scoring (up to 10 points)
-        if product.get('reviews'):
-            try:
-                # Extract number from formats like "1,234 reviews"
-                reviews_str = str(product['reviews']).replace(',', '')
-                review_count = int(re.search(r'\d+', reviews_str).group())
+                content = ""
+                if details and isinstance(details, list):
+                    for item in details:
+                        if isinstance(item, dict) and 'content' in item:
+                            content += item['content'] + '\n'
+                        elif isinstance(item, str):
+                            content += item + '\n'
                 
-                # Log scale for reviews: 0 reviews = 0 points, 10 reviews = 3 points, 
-                # 100 reviews = 6 points, 1000+ reviews = 10 points
-                if review_count > 0:
-                    import math
-                    review_points = min(3 * math.log10(review_count) + 3, 10)
-                    product['score'] += review_points
-            except (ValueError, AttributeError):
-                pass
-        
-        # Detail availability scoring (up to 10 points)
-        if product.get('details') and product['details'] != "No details found.":
-            # More detailed descriptions get more points
-            detail_length = len(str(product.get('details', '')))
-            detail_points = min(detail_length / 100, 10)  # 1 point per 100 chars, max 10
-            product['score'] += detail_points
-    
-    # Prepare subset of products for LLM analysis - select all products but limit text length
-    filtered_products = []
-    for product in products:
-        # Make sure we have basic info needed for display
-        if product.get('title'):
-            filtered_products.append(product)
-    
-    # If no products pass filtering, try again with no filtering
-    if not filtered_products:
-        filtered_products = [p for p in products if p.get('title')]
-    
-    # If still no products, return empty results
-    if not filtered_products:
-        return [], {"text": "No products matched your criteria.", "products": []}
-    
-    # Prepare text for LLM - take top 10 by initial score for detailed analysis
-    filtered_products.sort(key=lambda x: x.get('score', 0), reverse=True)
-    top_products_for_analysis = filtered_products[:10]
-    
-    products_details = []
-    for idx, p in enumerate(top_products_for_analysis, 1):
-        product_info = f"Product {idx}:\n"
-        product_info += f"Title: {p['title']}\n"
-        
-        if p.get('price'):
-            product_info += f"Price: {p['price']}\n"
-        
-        # Add rating and reviews if available
-        if p.get('rating'):
-            product_info += f"Rating: {p['rating']}\n"
-        if p.get('reviews'):
-            product_info += f"Reviews: {p['reviews']}\n"
-            
-        # Add specifications if available
-        if p.get('specifications') and isinstance(p['specifications'], dict) and p['specifications']:
-            product_info += "Specifications:\n"
-            for key, value in list(p['specifications'].items())[:5]:  # Limit to top 5 specs
-                product_info += f"- {key}: {value}\n"
-        
-        # Truncate details to reduce token usage
-        details = p.get('details', '')
-        if details and details != "No details found.":
-            details_snippet = details[:300] + "..." if len(details) > 300 else details
-            product_info += f"Details: {details_snippet}\n\n"
-        
-        products_details.append(product_info)
-    
-    products_text = "\n".join(products_details)
-    
-    prompt = f"""Original query: "{user_query}".
-
-            Products to analyze: {products_text}
-
-            """
-
-    try:
-        response = ollama.chat(model="llama3.1", messages=[
-            {"role": "system", "content": """You are a product ranking assistant focused on accurately matching products to user needs.
-             You are given a user query and a list of products. You need to rank the products based on how well they match the query.
-             I need you to analyze these products and rank them based on how well they match the query.
-            Consider:
-            1. Relevance to the original query
-            2. Quality (ratings and reviews)
-            3. Value for money
-            4. Features and specifications
-            
-            Format your response with the product number followed by the score and justification:
-            Product 1: Score X - [justification]
-            Product 2: Score Y - [justification]
-            
-             """},
-            {"role": "user", "content": prompt}
-        ])
-
-        ranking_output = response['message']['content'].strip()
-        
-        # Parse the LLM response
-        product_rankings = {}
-        for line in ranking_output.split('\n'):
-            if not line.strip():
-                continue
+                if not content:
+                    content = "No details found."
                 
-            # Extract product number, score and justification
-            match = re.match(r"Product (\d+):.*Score (\d+).*-\s*(.*)", line)
-            if match:
-                product_num = int(match.group(1))
-                score = int(match.group(2))
-                justification = match.group(3).strip()
+                # Use LLM to structure and summarize the details
+                prompt = f"""You are a product analysis expert. Analyze and structure the following product details into a clear, organized format.
+                Focus on key specifications, features, and important information.
                 
-                if 1 <= product_num <= len(top_products_for_analysis):
-                    product_rankings[product_num] = {
-                        "llm_score": score,
-                        "rank_reason": justification
+                Product: {product['title']}
+                Price: {product.get('price', 'N/A')}
+                Rating: {product.get('rating', 'N/A')}
+                Reviews: {product.get('reviews', 'N/A')}
+                
+                Raw Details: {content}
+                
+                You MUST respond with a valid JSON object in this exact format:
+                {{
+                    "key_features": [
+                        "feature 1",
+                        "feature 2",
+                        "feature 3"
+                    ],
+                    "pros": [
+                        "pro 1",
+                        "pro 2",
+                        "pro 3"
+                    ],
+                    "cons": [
+                        "con 1",
+                        "con 2",
+                        "con 3"
+                    ],
+                    "summary": "Brief overall summary of the product's value proposition"
+                }}
+                
+                CRITICAL RULES:
+                1. Your response MUST be a valid JSON object
+                2. Do not include any text before or after the JSON object
+                3. Use double quotes for all strings
+                4. Provide at least 3 items in each list
+                5. Use specific, detailed information
+                6. Focus on concrete features and specifications
+                7. Do not include any markdown formatting
+                8. Do not include any explanatory text
+                """
+                
+                response = ollama.chat(model='llama3.1', messages=[
+                    {
+                        'role': 'user',
+                        'content': prompt
                     }
+                ])
+                
+                try:
+                    # Clean the response to ensure it's valid JSON
+                    content = response['message']['content'].strip()
+                    # Remove any markdown code block markers
+                    content = content.replace('```json', '').replace('```', '').strip()
+                    
+                    # Try to fix common JSON formatting issues
+                    content = content.replace("'", '"')  # Replace single quotes with double quotes
+                    content = re.sub(r'(\w+):', r'"\1":', content)  # Add quotes to keys
+                    
+                    # Parse the JSON response
+                    try:
+                        structured_details = json.loads(content)
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"Initial JSON parsing failed for product {product.get('title')}, attempting to fix format")
+                        # Try to extract JSON-like structure using regex
+                        key_features_match = re.search(r'"key_features"\s*:\s*\[(.*?)\]', content, re.DOTALL)
+                        pros_match = re.search(r'"pros"\s*:\s*\[(.*?)\]', content, re.DOTALL)
+                        cons_match = re.search(r'"cons"\s*:\s*\[(.*?)\]', content, re.DOTALL)
+                        summary_match = re.search(r'"summary"\s*:\s*"(.*?)"', content, re.DOTALL)
+                        
+                        # Create structured details from matches
+                        structured_details = {
+                            'key_features': [f.strip().strip('"\'') for f in key_features_match.group(1).split(',')] if key_features_match else ['No key features found'],
+                            'pros': [p.strip().strip('"\'') for p in pros_match.group(1).split(',')] if pros_match else ['No pros found'],
+                            'cons': [c.strip().strip('"\'') for c in cons_match.group(1).split(',')] if cons_match else ['No cons found'],
+                            'summary': summary_match.group(1) if summary_match else 'No summary available'
+                        }
+                    
+                    # Validate the structure
+                    required_fields = ['key_features', 'pros', 'cons', 'summary']
+                    for field in required_fields:
+                        if field not in structured_details:
+                            structured_details[field] = [] if field != 'summary' else 'No summary available'
+                        elif field != 'summary' and not isinstance(structured_details[field], list):
+                            structured_details[field] = [str(structured_details[field])]
+                    
+                    # Format the sections for display
+                    formatted_details = {
+                        'key_features': '\n'.join(f"- {f}" for f in structured_details.get('key_features', [])) or "No key features found",
+                        'pros': '\n'.join(f"- {p}" for p in structured_details.get('pros', [])) or "No pros found",
+                        'cons': '\n'.join(f"- {c}" for c in structured_details.get('cons', [])) or "No cons found",
+                        'summary': structured_details.get('summary', 'No summary available')
+                    }
+                except Exception as e:
+                    logger.error(f"Error parsing response for product {product.get('title')}: {e}")
+                    # Create a default structured response
+                    structured_details = {
+                        'key_features': ['No key features found'],
+                        'pros': ['No pros found'],
+                        'cons': ['No cons found'],
+                        'summary': 'No summary available'
+                    }
+                    formatted_details = {
+                        'key_features': "No key features found",
+                        'pros': "No pros found",
+                        'cons': "No cons found",
+                        'summary': "No summary available"
+                    }
+                    
+                detailed_product = {
+                    **product,
+                    "raw_details": content,
+                    "structured_details": structured_details,
+                    "formatted_details": formatted_details
+                }
+                detailed_products.append(detailed_product)
+                    
+            except Exception as e:
+                logger.error(f"Error extracting specifications for product {product.get('title')}: {e}")
+                detailed_products.append({
+                    **product,
+                    "raw_details": "No details found.",
+                    "structured_details": "No structured details available.",
+                    "formatted_details": {
+                        'key_features': "No key features found",
+                        'pros': "No pros found",
+                        'cons': "No cons found",
+                        'summary': "No summary available"
+                    }
+                })
         
-        # Add LLM scores to products
-        for idx, product in enumerate(top_products_for_analysis, 1):
-            if idx in product_rankings:
-                # LLM score is on a scale of 1-10, multiply by 10 to match other scores
-                product["llm_score"] = product_rankings[idx]["llm_score"] * 10
-                product["score"] += product["llm_score"]  # Add to total score
-                product["rank_reason"] = product_rankings[idx]["rank_reason"]
-            else:
-                # Default values if parsing failed
-                product["llm_score"] = 0
-                product["rank_reason"] = "No specific ranking information available."
-        
-        # Now generate detailed descriptions for top products
-        top_products = top_products_for_analysis # Take top 5 for detailed descriptions
-        
-        detailed_prompt = f"""The user searched for: "{user_query}"
-
-                        I need you to analyze these products in relation to the search query: "{top_products}"
-                        """
-        
+        state["detailed_products"] = detailed_products
+        state["status"]["extract_specifications"] = f"Completed: Extracted and structured details for {len(detailed_products)} products"
+        state["status"]["rank_products"] = "Pending"
+        return state
+    
+    async def _rank_products_node(self, state: ProductState) -> ProductState:
+        """Rank products based on LLM analysis of their details and user requirements"""
         try:
-            detailed_response = ollama.chat(model="llama3.1", messages=[
-                {"role": "system", "content": """You are a product recommendation expert who provides concise, helpful product analyses.
-                 You are given a user query and a list of products. You need to analyze the products and provide a detailed explanation of why they are the best choices for the user, 
-                 along with their pros and cons.
-                 
-                 Format your response as:
-                 
-                 PRODUCT 1 DESCRIPTION:
-                 [Why this product is a good fit for the user's query]
-
-                 PRODUCT 1 PROS AND CONS:
-                 + [Pro 1]
-                 + [Pro 2]
-                 + [Pro 3]
-                 - [Con 1]
-                 - [Con 2]
-                 
-                 After all product descriptions, add a section titled "TOP RECOMMENDATIONS:" where you highlight the 1-3 best products and explain why they stand out as the top choices (3-4 sentences).
-                 """},
-                {"role": "user", "content": detailed_prompt}
+            # Process products in batches of 5
+            batch_size = 5
+            all_ranked_products = []
+            
+            for i in range(0, len(state["detailed_products"]), batch_size):
+                batch_products = state["detailed_products"][i:i + batch_size]
+                
+                # Create a prompt for analyzing the batch of products
+                prompt = f"""You are a product analysis expert. Analyze and rank these products based on multiple criteria.
+                Consider the user's requirements and provide a comprehensive analysis with detailed scoring.
+                
+                User Requirements:
+                - Basic Query: {state['query']}
+                - Max Price: {state['max_price']} euros
+                - Additional Requirements: {state['additional_requirements']}
+                
+                Products to Analyze:
+                {json.dumps([{
+                    'title': p['title'],
+                    'price': p.get('price', 'N/A'),
+                    'rating': p.get('rating', 'N/A'),
+                    'reviews': p.get('reviews', 'N/A'),
+                    'structured_details': p.get('structured_details', '')
+                } for p in batch_products], indent=2)}
+                
+                You MUST respond with a valid JSON object in this exact format:
+                {{
+                    "products": [
+                        {{
+                            "title": "exact product title",
+                            "price": "price",
+                            "scores": {{
+                                "performance": 1-10,
+                                "value_for_money": 1-10,
+                                "matching_requirements": 1-10,
+                                "overall_score": 1-10
+                            }},
+                            "analysis": {{
+                                "performance_analysis": "Detailed analysis of product performance based on specs and features",
+                                "value_analysis": "Analysis of price vs features and quality",
+                                "requirements_match": "How well it matches user requirements",
+                                "why_recommended": "Overall recommendation reason"
+                            }}
+                        }},
+                        ...
+                    ],
+                    "overall_analysis": "Brief analysis comparing the products and explaining the rankings"
+                }}
+                
+                CRITICAL RULES:
+                1. Your response MUST be a valid JSON object
+                2. Do not include any text before or after the JSON object
+                3. Use double quotes for all strings
+                4. Include all products in the analysis
+                5. Provide specific, detailed explanations for each score
+                6. Consider the following for scoring:
+                   - Performance: Based on specifications, features, and capabilities
+                   - Value for Money: Price vs features, quality, and market comparison
+                   - Matching Requirements: How well it meets user's specific needs
+                   - Overall Score: Weighted combination of all factors
+                7. Scores must be between 1-10 (whole numbers)
+                8. Provide detailed analysis for each scoring category
+                9. Do not include any markdown formatting
+                10. Do not include any explanatory text
+                """
+                
+                # Get LLM's analysis for this batch
+                response = ollama.chat(model='llama3.1', messages=[
+                    {
+                        'role': 'user',
+                        'content': prompt
+                    }
+                ])
+                
+                try:
+                    # Clean the response to ensure it's valid JSON
+                    content = response['message']['content'].strip()
+                    # Remove any markdown code block markers
+                    content = content.replace('```json', '').replace('```', '').strip()
+                    
+                    # Parse the JSON response
+                    analysis_data = json.loads(content)
+                    
+                    # Process the analysis to extract product rankings
+                    for product_analysis in analysis_data.get('products', []):
+                        # Validate required fields
+                        if 'title' not in product_analysis:
+                            continue
+                        
+                        # Ensure all required fields exist with defaults
+                        scores = product_analysis.get('scores', {})
+                        analysis = product_analysis.get('analysis', {})
+                        
+                        # Set default scores if missing
+                        default_scores = {
+                            'performance': 5,
+                            'value_for_money': 5,
+                            'matching_requirements': 5,
+                            'overall_score': 5
+                        }
+                        for key in default_scores:
+                            if key not in scores:
+                                scores[key] = default_scores[key]
+                        
+                        # Set default analysis if missing
+                        default_analysis = {
+                            'performance_analysis': 'No performance analysis available',
+                            'value_analysis': 'No value analysis available',
+                            'requirements_match': 'No requirements match analysis available',
+                            'why_recommended': 'No recommendation reason provided'
+                        }
+                        for key in default_analysis:
+                            if key not in analysis:
+                                analysis[key] = default_analysis[key]
+                        
+                        # Find the matching product
+                        matching_product = next(
+                            (p for p in batch_products 
+                             if p['title'].lower() in product_analysis['title'].lower() or 
+                             product_analysis['title'].lower() in p['title'].lower()),
+                            None
+                        )
+                        
+                        if matching_product:
+                            # Get the formatted details from extract_specifications_node
+                            formatted_details = matching_product.get('formatted_details', {})
+                            
+                            # Create the analysis object
+                            product_analysis = {
+                                'key_features': formatted_details.get('key_features', 'No key features found'),
+                                'pros': formatted_details.get('pros', 'No pros found'),
+                                'cons': formatted_details.get('cons', 'No cons found'),
+                                'scores': scores,
+                                'analysis': analysis,
+                                'price': matching_product.get('price', 'N/A')
+                            }
+                            
+                            # Add the analysis to the product
+                            all_ranked_products.append({
+                                **matching_product,
+                                "analysis": product_analysis
+                            })
+                
+                except json.JSONDecodeError as e:
+                    logger.error(f"Error parsing JSON response in rank_products_node for batch {i//batch_size + 1}: {e}")
+                    # Create a basic analysis for products in this batch
+                    for product in batch_products:
+                        formatted_details = product.get('formatted_details', {})
+                        basic_analysis = {
+                            'key_features': formatted_details.get('key_features', 'No key features found'),
+                            'pros': formatted_details.get('pros', 'No pros found'),
+                            'cons': formatted_details.get('cons', 'No cons found'),
+                            'scores': {
+                                'performance': 5,
+                                'value_for_money': 5,
+                                'matching_requirements': 5,
+                                'overall_score': 5
+                            },
+                            'analysis': {
+                                'performance_analysis': 'No performance analysis available',
+                                'value_analysis': 'No value analysis available',
+                                'requirements_match': 'No requirements match analysis available',
+                                'why_recommended': 'No recommendation reason provided'
+                            },
+                            'price': product.get('price', 'N/A')
+                        }
+                        all_ranked_products.append({
+                            **product,
+                            "analysis": basic_analysis
+                        })
+            
+            # Add any remaining products that weren't analyzed
+            analyzed_titles = {p['title'].lower() for p in all_ranked_products}
+            for product in state["detailed_products"]:
+                if product['title'].lower() not in analyzed_titles:
+                    # Create a basic analysis for unanalyzed products
+                    formatted_details = product.get('formatted_details', {})
+                    basic_analysis = {
+                        'key_features': formatted_details.get('key_features', 'No key features found'),
+                        'pros': formatted_details.get('pros', 'No pros found'),
+                        'cons': formatted_details.get('cons', 'No cons found'),
+                        'scores': {
+                            'performance': 5,
+                            'value_for_money': 5,
+                            'matching_requirements': 5,
+                            'overall_score': 5
+                        },
+                        'analysis': {
+                            'performance_analysis': 'No performance analysis available',
+                            'value_analysis': 'No value analysis available',
+                            'requirements_match': 'No requirements match analysis available',
+                            'why_recommended': 'No recommendation reason provided'
+                        },
+                        'price': product.get('price', 'N/A')
+                    }
+                    all_ranked_products.append({
+                        **product,
+                        "analysis": basic_analysis
+                    })
+            
+            # Sort products by overall score
+            all_ranked_products.sort(key=lambda x: x.get('analysis', {}).get('scores', {}).get('overall_score', 0), reverse=True)
+            
+            # Store all ranked products but only return top 10
+            state["ranked_products"] = all_ranked_products[:10]
+            state["status"]["rank_products"] = f"Completed: Ranked {len(all_ranked_products)} products, displaying top 10"
+            state["status"]["generate_recommendations"] = "Pending"
+            
+            return state
+            
+        except Exception as e:
+            logger.error(f"Error in rank_products_node: {e}")
+            state["ranked_products"] = state["detailed_products"][:10]  # Limit to top 10 even in case of error
+            state["status"]["rank_products"] = f"Failed: {str(e)}"
+            state["status"]["generate_recommendations"] = "Pending"
+            return state
+    
+    async def _generate_recommendations_node(self, state: ProductState) -> ProductState:
+        """Generate personalized product recommendations using LLM"""
+        try:
+            recommendations = []
+            products = state["ranked_products"]  # Already limited to top 10
+            
+            # Create a prompt for personalized recommendations
+            prompt = f"""You are a product analysis expert. Analyze these products and give a detailed explanation on why this product is recommended.
+            Consider the user's requirements and provide a comprehensive analysis.
+            Consider the user's query: {state['query']}
+            Max Price: {state['max_price']} euros
+            
+            Ranked Products:
+            {json.dumps([{
+                'title': p['title'],
+                'price': p.get('price', 'N/A'),
+                'rating': p.get('rating', 'N/A'),
+                'reviews': p.get('reviews', 'N/A'),
+                'analysis': p.get('analysis', '')
+            } for p in products[:3]], indent=2)}
+            
+            Please provide recommendations in the following format:
+            
+            Top Recommendations:
+            
+            [product name]
+            Why Recommended: [detailed explanation of why this product is recommended]
+            
+            [product name]
+            Why Recommended: [detailed explanation of why this product is recommended]
+            
+            [product name]
+            Why Recommended: [detailed explanation of why this product is recommended]
+            
+            Overall Analysis:
+            [Brief analysis regarding why these 3 products are recommended as top products]
+            
+            
+            CRITICAL RULES:
+            1. Don't include the ratings given during the ranking process.
+            2. Don't give responses such as "Same as the above", or something similar. Make sure that you provide explanation to each product, individually.
+            3. You must provide a detailed explaination based on the information you have regarding the product. """
+            
+            response = ollama.chat(model='llama3.1', messages=[
+                {
+                    'role': 'user',
+                    'content': prompt
+                }
             ])
             
-            detailed_output = detailed_response['message']['content'].strip()
+            recommendations_text = response['message']['content']
             
-            # Parse detailed descriptions for each product
-            descriptions = {}
-            top_recommendations_text = ""
+            # Extract recommended products
+            recommended_products = []
+            for product in products[:3]:  # Only take top 3
+                recommendation_reason = self._extract_recommendation_reason(recommendations_text, product['title'])
+                recommended_products.append({
+                    **product,
+                    "recommendation_reason": recommendation_reason if recommendation_reason else "No specific reasoning found"
+                })
             
-            # Split by "TOP RECOMMENDATIONS:" to separate product descriptions from recommendations
-            parts = detailed_output.split("TOP RECOMMENDATIONS:")
-            product_descriptions_part = parts[0].strip()
+            state["recommendations"] = recommended_products
+            state["recommendations_analysis"] = recommendations_text
+            state["status"]["generate_recommendations"] = f"Completed: Generated {len(recommended_products)} personalized recommendations"
+            return state
             
-            if len(parts) > 1:
-                top_recommendations_text = parts[1].strip()
+        except Exception as e:
+            logger.error(f"Error in generate_recommendations_node: {e}")
+            state["recommendations"] = []
+            state["recommendations_analysis"] = "Failed to generate recommendations"
+            state["status"]["generate_recommendations"] = f"Failed: {str(e)}"
+            return state
+    
+    def _extract_recommendation_reason(self, recommendations_text: str, product_title: str) -> str:
+        """Extract the reasoning for a specific product recommendation"""
+        try:
+            # Find the section containing the product title
+            lines = recommendations_text.split('\n')
+            for i, line in enumerate(lines):
+                if product_title.lower() in line.lower():
+                    # Look for the next line starting with "Why Recommended:"
+                    for j in range(i, min(i + 5, len(lines))):
+                        if lines[j].strip().startswith("Why Recommended:"):
+                            return lines[j].replace("Why Recommended:", "").strip()
+            return "No specific reasoning found"
+        except Exception:
+            return "No specific reasoning found"
+
+    def _should_end(self, state: ProductState) -> bool:
+        """Determine if the workflow should end"""
+        return True  # Always end after generating recommendations
+
+class ShoppingAssistant:
+    def __init__(self):
+        self.graph = ShoppingGraph()
+    
+    async def process_shopping_query(self, query: str, max_price: Optional[float] = None, additional_requirements: str = "") -> Dict[str, Any]:
+        """Process a shopping query through the entire workflow"""
+        initial_state = ProductState(
+            query=query,
+            max_price=max_price,
+            additional_requirements=additional_requirements,
+            products=[],
+            processed_query={},
+            detailed_products=[],
+            ranked_products=[],
+            recommendations=[],
+            recommendations_analysis="",
+            status={}
+        )
+        
+        try:
+            # Execute the workflow
+            final_state = await self.graph.graph.ainvoke(initial_state)
             
-            # Extract individual product descriptions
-            products_desc_blocks = re.split(r'PRODUCT \d+ DESCRIPTION:', product_descriptions_part)
-            for i, desc_block in enumerate(products_desc_blocks[1:], 1):  # Skip the first empty split
-                # Split by "PRODUCT X PROS AND CONS:" to separate description from pros/cons
-                if "PRODUCT" in desc_block and "PROS AND CONS:" in desc_block:
-                    desc_parts = desc_block.split("PRODUCT")
-                    description = desc_parts[0].strip()
-                    descriptions[i] = description
-                else:
-                    descriptions[i] = desc_block.strip()
-            
-            # Extract pros and cons
-            pros_cons = {}
-            pros_cons_blocks = re.findall(r'PRODUCT \d+ PROS AND CONS:([\s\S]*?)(?=PRODUCT \d+|TOP RECOMMENDATIONS:|$)', product_descriptions_part)
-            for i, pc_block in enumerate(pros_cons_blocks, 1):
-                pros = re.findall(r'\+\s*(.*)', pc_block)
-                cons = re.findall(r'-\s*(.*)', pc_block)
-                pros_cons[i] = {
-                    "pros": pros,
-                    "cons": cons
+            if final_state is None:
+                logger.error("Graph execution returned None")
+                return {
+                    "processed_query": {
+                        "translated": query,
+                        "restructured": query,
+                        "original_requirements": additional_requirements
+                    },
+                    "products": [],
+                    "detailed_products": [],
+                    "ranked_products": [],
+                    "recommendations": [],
+                    "recommendations_analysis": "Failed to generate recommendations",
+                    "status": {
+                        "process_query": "Failed: Graph execution returned None",
+                        "search_products": "Not started",
+                        "extract_specifications": "Not started",
+                        "rank_products": "Not started",
+                        "generate_recommendations": "Not started"
+                    }
                 }
             
-            # Add descriptions and pros/cons to products
-            for idx, product in enumerate(top_products, 1):
-                if idx in descriptions:
-                    product["detailed_description"] = descriptions[idx]
-                else:
-                    product["detailed_description"] = f"This {product['title']} appears to be a good match for your search."
-                
-                if idx in pros_cons:
-                    product["pros"] = pros_cons[idx]["pros"]
-                    product["cons"] = pros_cons[idx]["cons"]
-                else:
-                    product["pros"] = []
-                    product["cons"] = []
+            # Ensure we have a valid state
+            if not isinstance(final_state, dict):
+                logger.error(f"Invalid state type: {type(final_state)}")
+                return initial_state
             
-            # Spread descriptions to other products with similar titles
-            for product in filtered_products:
-                if not product.get("detailed_description"):
-                    # Try to find a similar product with a description
-                    for described_product in top_products:
-                        if described_product.get("detailed_description") and similar_titles(product['title'], described_product['title']):
-                            product["detailed_description"] = described_product["detailed_description"]
-                            product["pros"] = described_product.get("pros", [])
-                            product["cons"] = described_product.get("cons", [])
-                            break
-                    
-                    # If still no description, create a generic one
-                    if not product.get("detailed_description"):
-                        product["detailed_description"] = f"This product appears to match your search for '{user_query}'."
-                        product["pros"] = ["Matches your search criteria"]
-                        product["cons"] = ["Limited information available"]
+            # Save results to CSV
+            save_to_csv(
+                query=query,
+                max_price=max_price,
+                additional_requirements=additional_requirements,
+                raw_products=final_state.get("products", []),
+                ranked_products=final_state.get("ranked_products", []),
+                recommendations=final_state.get("recommendations", [])
+            )
             
-            # Create top recommendations object
-            # Sort by score for final ranking
-            filtered_products.sort(key=lambda x: x.get('score', 0), reverse=True)
-            
-            top_recommendations = {
-                "text": top_recommendations_text if top_recommendations_text else "Based on your search, these are the best options available.",
-                "products": filtered_products[:3]  # Get top 3 ranked products
+            return {
+                "processed_query": final_state.get("processed_query", {
+                    "translated": query,
+                    "restructured": query,
+                    "original_requirements": additional_requirements
+                }),
+                "products": final_state.get("products", []),
+                "detailed_products": final_state.get("detailed_products", []),
+                "ranked_products": final_state.get("ranked_products", []),
+                "recommendations": final_state.get("recommendations", []),
+                "recommendations_analysis": final_state.get("recommendations_analysis", ""),
+                "status": final_state.get("status", {})
             }
-                
         except Exception as e:
-            logger.error(f"Error generating detailed descriptions: {e}")
-            # Add default descriptions if detailed generation fails
-            for product in filtered_products:
-                if not product.get("detailed_description"):
-                    product["detailed_description"] = f"This product matches your search for '{user_query}'."
-            
-            top_recommendations = {
-                "text": "Based on your search, these are the best options available.",
-                "products": filtered_products[:3]
-            }
-        
-        # Calculate final ranks based on score
-        filtered_products.sort(key=lambda x: x.get('score', 0), reverse=True)
-        for rank, product in enumerate(filtered_products, 1):
-            product["rank"] = rank
-        
-        # Clean up temporary fields
-        for product in filtered_products:
-            # Build specifications from pros and cons if not already present
-            if not product.get('specifications') or not product['specifications']:
-                product['specifications'] = {}
-                
-                # Add pros and cons to specifications
-                if product.get('pros') or product.get('cons'):
-                    pros_text = "\n".join([f"+ {pro}" for pro in product.get('pros', [])])
-                    cons_text = "\n".join([f"- {con}" for con in product.get('cons', [])])
-                    
-                    if pros_text or cons_text:
-                        product['specifications']['Pros & Cons'] = f"{pros_text}\n{cons_text}"
-                    
-                # Create key features from rank reason if available
-                if product.get('rank_reason'):
-                    product['specifications']['Key Features'] = product['rank_reason']
-                
-                # Add dummy specs if nothing else available
-                if not product['specifications']:
-                    product['specifications'] = {
-                        "Product": product.get('title', 'Unknown'),
-                        "Price": product.get('price', 'Not specified'),
-                        "Rating": product.get('rating', 'Not rated')
-                    }
-            
-            # Remove scoring fields that shouldn't be in the final output
-            fields_to_remove = ['score', 'price_score', 'price_numeric', 'llm_score', 'filtered_by_price']
-            for field in fields_to_remove:
-                if field in product:
-                    del product[field]
-                
-        return filtered_products, top_recommendations
-
-    except Exception as e:
-        logger.error(f"Error ranking products: {e}")
-        # Fallback: just sort by rating and return all products
-        for product in filtered_products:
-            # Clean up temporary fields
-            for field in ['score', 'price_score', 'price_numeric', 'llm_score', 'filtered_by_price']:
-                if field in product:
-                    del product[field]
-            
-            # Add missing fields
-            if not product.get("rank_reason") or len(product.get("rank_reason", "")) < 10:
-                product["rank_reason"] = f"This product matches your search criteria for '{user_query}'."
-            if not product.get("detailed_description"):
-                product["detailed_description"] = f"This product appears to be relevant to your search for '{user_query}'."
-            
-            # Make sure specifications exist
-            if not product.get("specifications") or not isinstance(product["specifications"], dict):
-                product["specifications"] = {
-                    "Product": product.get("title", "Unknown"),
-                    "Price": product.get("price", "Not specified"),
-                    "Rating": product.get("rating", "Not rated")
+            logger.error(f"Error in process_shopping_query: {e}")
+            return {
+                "processed_query": {
+                    "translated": query,
+                    "restructured": query,
+                    "original_requirements": additional_requirements
+                },
+                "products": [],
+                "detailed_products": [],
+                "ranked_products": [],
+                "recommendations": [],
+                "recommendations_analysis": "Failed to generate recommendations",
+                "status": {
+                    "process_query": f"Failed: {str(e)}",
+                    "search_products": "Not started",
+                    "extract_specifications": "Not started",
+                    "rank_products": "Not started",
+                    "generate_recommendations": "Not started"
                 }
-            
-        # Simple sorting by rating as fallback
-        try:
-            filtered_products.sort(key=lambda x: float(str(x.get('rating', '0')).split()[0]), reverse=True)
-        except:
-            pass  # If rating sorting fails, keep original order
-            
-        # Assign ranks
-        for rank, product in enumerate(filtered_products, 1):
-            product["rank"] = rank
-            
-        default_top_recommendations = {
-            "text": "Based on your search, these products might be a good match.",
-            "products": filtered_products[:3] if len(filtered_products) >= 3 else filtered_products
-        }
+            }
+
+def save_to_csv(query: str, max_price: float, additional_requirements: str, 
+                raw_products: List[Dict], ranked_products: List[Dict], 
+                recommendations: List[Dict]) -> None:
+    """Save search results and rankings to a CSV file"""
+    try:
+        # Create a timestamp for the filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"shopping_results_{timestamp}.csv"
         
-        return filtered_products, default_top_recommendations
-
-def similar_titles(title1, title2):
-    """Check if two product titles are similar enough to share descriptions"""
-    # Convert to lowercase and remove common punctuation
-    title1 = title1.lower().replace(',', '').replace('.', '')
-    title2 = title2.lower().replace(',', '').replace('.', '')
-    
-    # If one title is completely contained in the other, they're similar
-    if title1 in title2 or title2 in title1:
-        return True
-    
-    # Count matching words
-    words1 = set(title1.split())
-    words2 = set(title2.split())
-    common_words = words1.intersection(words2)
-    
-    # If they share at least 3 significant words, consider them similar
-    return len(common_words) >= 3
-
-def extract_price(price_str):
-    """Extract numeric price from string"""
-    if not price_str:
-        return float('inf')
-    try:
-        return float(re.sub(r"[^\d.]", "", price_str))
-    except:
-        return float('inf')
-
-def sort_results(results, sort_by):
-    """Sort results by specified criteria"""
-    if sort_by == "Price: Low to High":
-        return sorted(results, key=lambda r: extract_price(r.get("price", "inf")))
-    elif sort_by == "Price: High to Low":
-        return sorted(results, key=lambda r: extract_price(r.get("price", "0")), reverse=True)
-    return results
-
-def extract_budget(query):
-    """Extract budget from query"""
-    patterns = [
-        r"under\s+(\d+)",
-        r"less than\s+(\d+)",
-        r"below\s+(\d+)",
-        r"max\s+(\d+)",
-        r"maximum\s+(\d+)"
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, query, re.IGNORECASE)
-        if match:
-            return int(match.group(1))
-    return None
-
-def summarize_with_llama(content):
-    """Summarize product content with caching"""
-    if not content or len(content) < 100:
-        return "No detailed description available."
-
-    # Truncate content to reduce token usage
-    content_sample = content[:3000] if len(content) > 3000 else content
-
-    prompt = f"""Summarize this product description concisely (max 2-3 sentences):
-
-{content_sample}
-
-Focus on key features, benefits, and unique selling points."""
-
-    try:
-        response = ollama.chat(model="llama3.1", messages=[
-            {"role": "system", "content": "You are a concise product summarizer."},
-            {"role": "user", "content": prompt}
-        ])
-
-        return response['message']['content'].strip()
+        # Get the restructured query from the first product if available
+        restructured_query = query
+        if raw_products and 'processed_query' in raw_products[0]:
+            restructured_query = raw_products[0]['processed_query'].get('restructured', query)
+        
+        # Prepare data for raw products (all SerpAPI products)
+        raw_data = []
+        for product in raw_products:
+            raw_data.append({
+                'query': restructured_query,
+                'max_price': max_price,
+                'additional_requirements': additional_requirements,
+                'product_type': 'raw',
+                'title': product.get('title', ''),
+                'url': product.get('url', '')
+            })
+        
+        # Prepare data for top 10 ranked products
+        ranked_data = []
+        # Ensure we're using the sorted ranked products (they should already be sorted by overall score)
+        for i, product in enumerate(ranked_products[:10], 1):  # Only take top 10 ranked products
+            ranked_data.append({
+                'query': restructured_query,
+                'max_price': max_price,
+                'additional_requirements': additional_requirements,
+                'product_type': f'ranked_{i}',  # Add rank number to product_type
+                'title': product.get('title', ''),
+                'url': product.get('url', '')
+            })
+        
+        # Combine data in the desired order: raw products first, then ranked products
+        all_data = raw_data + ranked_data
+        
+        # Create DataFrame and save to CSV
+        df = pd.DataFrame(all_data)
+        df.to_csv(filename, index=False)
+        logger.info(f"Results saved to {filename}")
+        
     except Exception as e:
-        logger.error(f"Error summarizing content: {e}")
-        return content[:200] + "..." if len(content) > 200 else content
+        logger.error(f"Error saving results to CSV: {e}")
 
-def generate_comparison_table(products):
-    """Generate comparison table for products"""
-    if len(products) < 2:
-        return {"Title": ["N/A"], "Price": ["N/A"], "Rating": ["N/A"],
-                "Key Features": ["N/A"], "Pros/Cons": ["N/A"]}
-
-    comparison = {
-        "Title": [],
-        "Price": [],
-        "Rating": [],
-        "Key Features": [],
-        "Pros/Cons": [],
-    }
-
-    # Add basic information first
-    for p in products[:3]:  # Limit to top 3
-        comparison["Title"].append(p.get("title", "N/A"))
-        comparison["Price"].append(p.get("price", "N/A"))
-        comparison["Rating"].append(str(p.get("rating", "N/A")))
-
-        # Pre-fill with empty values
-        comparison["Key Features"].append("Loading...")
-        comparison["Pros/Cons"].append("Loading...")
-
-    # Function to process a single product
-    def process_product_comparison(idx, product):
-        content = product.get("content", "")
-        if not content or len(content) < 100:
-            return idx, "No detailed information available.", "N/A"
-
-        cache_key = f"comparison_{hash(content[:500])}"
-        if cache_key in llm_cache:
-            result = llm_cache[cache_key]
-            return idx, result["features"], result["pros_cons"]
-
-        prompt = f"""Extract from this product description:
-1. Key Features (bullet list of 3-4 main features)
-2. Pros and Cons (2-3 of each)
-
-Product: {product.get('title')}
-Description: {content[:2000] if len(content) > 2000 else content}
-
-Format your response exactly as:
-Key Features:
-• Feature 1
-• Feature 2
-• Feature 3
-
-Pros:
-• Pro 1
-• Pro 2
-
-Cons:
-• Con 1
-• Con 2"""
-
-        try:
-            response = ollama.chat(model="llama3.1", messages=[
-                {"role": "system", "content": "You extract product comparison data."},
-                {"role": "user", "content": prompt}
-            ])
-
-            summary = response['message']['content']
-
-            # Split the response
-            if "Pros:" in summary:
-                features = summary.split("Pros:")[0].strip()
-                pros_cons = "Pros:" + summary.split("Pros:")[1].strip()
-            else:
-                features = summary
-                pros_cons = "No pros/cons information available."
-            return idx, features, pros_cons
-
-        except Exception as e:
-            logger.error(f"Error generating comparison: {e}")
-            return idx, "Error extracting features.", "Error extracting pros/cons."
-
-    # Process products in parallel
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-        futures = [executor.submit(process_product_comparison, i, p) for i, p in enumerate(products[:3])]
-
-        for future in concurrent.futures.as_completed(futures):
-            idx, features, pros_cons = future.result()
-            comparison["Key Features"][idx] = features
-            comparison["Pros/Cons"][idx] = pros_cons
-
-    return comparison
-
-def generate_recommendations(products, user_query):
-    """Generate personalized product recommendations"""
-    if not products or len(products) < 2:
-        return "Not enough products to generate recommendations."
-
-    # Prepare a simplified product list to reduce token usage
-    simplified_products = []
-    for p in products[:5]:  # Limit to top 5 for recommendations
-        simplified = {
-            "title": p.get("title", ""),
-            "price": p.get("price", ""),
-            "rating": p.get("rating", ""),
-            "reviews": p.get("reviews", ""),
-            "features": summarize_with_llama(p.get("content", "")) if p.get("content") else ""
-        }
-        simplified_products.append(simplified)
-
-    prompt = f"""As a product recommendation expert, analyze these products for the query: "{user_query}"
-
-Select the top 1-2 recommended products and explain why they're best for this specific query.
-
-Products:
-{json.dumps(simplified_products, indent=2)}
-
-Format your response as a recommendation to the user:
-1. Clear explanation of what makes a good choice for this query
-2. Your top picks with brief reasoning for each
-3. Any additional advice for this purchase"""
-
-    try:
-        response = ollama.chat(model="llama3.1", messages=[
-            {"role": "system", "content": "You are a helpful recommendation engine that gives clear, decisive advice."},
-            {"role": "user", "content": prompt}
-        ])
-
-        return response['message']['content'].strip()
-    except Exception as e:
-        logger.error(f"Error generating recommendations: {e}")
-        return "Unable to generate personalized recommendations at this time."
+# Export the ShoppingAssistant class
+__all__ = ['ShoppingAssistant'] 
