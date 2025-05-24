@@ -486,6 +486,12 @@ class ShoppingGraph:
                 8. Provide detailed analysis for each scoring category
                 9. Do not include any markdown formatting
                 10. Do not include any explanatory text
+                11. IMPORTANT: When evaluating ratings:
+                    - If a product has less than 10 reviews, give minimal weight to its rating
+                    - If a product has 10-50 reviews, give moderate weight to its rating
+                    - If a product has more than 50 reviews, give full weight to its rating
+                    - Products with no reviews should be evaluated based on their specifications and features only
+                12. Always mention the number of reviews in your analysis when discussing ratings
                 """
                 
                 # Get LLM's analysis for this batch
@@ -831,9 +837,11 @@ def save_to_csv(query: str, max_price: float, additional_requirements: str,
                 recommendations: List[Dict]) -> None:
     """Save search results and rankings to a CSV file"""
     try:
-        # Create a timestamp for the filename
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"shopping_results_{timestamp}.csv"
+        # Create a filename from the query
+        # Replace spaces and special characters with underscores
+        safe_query = re.sub(r'[^a-zA-Z0-9\s-]', '', query)
+        safe_query = safe_query.replace(' ', '_').lower()
+        filename = f"shopping_results_{safe_query}.csv"
         
         # Get the restructured query from the first product if available
         restructured_query = query
